@@ -28,6 +28,14 @@ export type BookableCategory = (typeof BOOKABLE_CATEGORIES)[number];
 export type LodgingStyle = "budget" | "standard" | "luxury";
 export type Pace = "relaxed" | "balanced" | "packed";
 
+/**
+ * What kind of event a request is. This is a label for the product surface
+ * (filters, grouping): the planner treats every type the same today and always
+ * produces flights / lodging / activities / estimates.
+ */
+export const EVENT_TYPES = ["flight", "vacation", "shopping", "international", "local"] as const;
+export type EventType = (typeof EVENT_TYPES)[number];
+
 export interface TravelerProfile {
   givenName: string;
   familyName: string;
@@ -63,6 +71,8 @@ export interface TripRequest {
   budgetCents: Cents;
   preferences: TripPreferences;
   travelerProfiles?: TravelerProfile[];
+  /** Optional label used by the app to filter and group events. */
+  eventType?: EventType;
 }
 
 // ---------------------------------------------------------------------------

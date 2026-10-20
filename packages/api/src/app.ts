@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
-import { DuffelClient, type ReplanTrigger } from "@solagent/shared";
+import { DuffelClient, EVENT_TYPES, type ReplanTrigger } from "@solagent/shared";
 import { createPlannerFromEnv, type TripPlanner } from "@solagent/planner";
 import {
   BookingExecutor,
@@ -11,7 +11,8 @@ import {
   SandboxSupplier,
   SupplierRegistry,
 } from "@solagent/booking";
-import { BadRequestError, NotFoundError, TripService, type TripEvent } from "./trips.ts";
+import { BadRequestError, NotFoundError, summarizeTrip, TripService, type TripEvent } from "./trips.ts";
+import { SqliteTripStore } from "./store.ts";
 
 const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "YYYY-MM-DD");
 
@@ -48,6 +49,7 @@ const tripRequestSchema = z
       )
       .optional(),
     mode: z.enum(["optimizer", "agent"]).optional(),
+    eventType: z.enum(EVENT_TYPES).optional(),
   })
   .refine((r) => r.endDate > r.startDate, { message: "endDate must be after startDate" });
 
@@ -82,9 +84,16 @@ export function createDeps(): AppDeps {
   if (duffel) suppliers.register(new DuffelFlightSupplier(duffel));
   const payments = new SandboxPaymentGateway();
   const executor = new BookingExecutor(suppliers, payments);
-  const service = new TripService(planner, executor, payments, {
-    autoApproveUpToCents: Number(process.env.AUTO_APPROVE_UP_TO_CENTS ?? 50_000),
-  });
+  // DATABASE_PATH=":memory:" runs SQLite in memory (handy for a throwaway
+  // demo); unset it or point it at a file path to persist across restarts.
+  const store = new SqliteTripStore(process.env.DATABASE_PATH ?? "data/trips.db");
+  const service = new TripService(
+    planner,
+    executor,
+    payments,
+    { autoApproveUpToCents: Number(process.env.AUTO_APPROVE_UP_TO_CENTS ?? 50_000) },
+    store,
+  );
   return { planner, service, sandbox };
 }
 
@@ -109,9 +118,8 @@ export function createApp(deps: AppDeps = createDeps()) {
     return c.json(trip, 201);
   });
 
-  app.get("/trips", (c) =>
-    c.json(service.list().map((t) => ({ id: t.id, summary: t.plan.summary, version: t.plan.version }))),
-  );
+  /** One row per trip with everything a list screen needs (id, summary and version are unchanged). */
+  app.get("/trips", (c) => c.json(service.list().map(summarizeTrip)));
   app.get("/trips/:id", (c) => c.json(service.get(c.req.param("id"))));
   app.get("/trips/:id/plan", (c) => c.json(service.get(c.req.param("id")).plan));
 

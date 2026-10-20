@@ -5,9 +5,11 @@ import {
   type BookingOutcome,
   type Category,
   type Cents,
+  type EventType,
   type PaymentGateway,
   type PlanChange,
   type PlanItem,
+  type PlanItemStatus,
   type ReplanTrigger,
   type SpendAuthorization,
   type TravelPlan,
@@ -22,6 +24,7 @@ import {
 } from "@solagent/planner";
 import type { BookingExecutor } from "@solagent/booking";
 import type { SpendingRules } from "@solagent/booking";
+import { InMemoryTripStore, type TripStore } from "./store.ts";
 
 /**
  * Trip lifecycle orchestration: the glue between the planner (A), the payments
@@ -32,7 +35,10 @@ import type { SpendingRules } from "@solagent/booking";
  *   outcomes    -> price changes / failures feed back into the replanner
  *   refreshPrices / replan -> continuous replanning
  *
- * State is in memory for the MVP; swap TripStore for a database later.
+ * Persistence is pluggable via TripStore (see ./store.ts). Every mutating
+ * method ends by calling emit(), which is the single point that writes the
+ * trip back to the store — so adding a new mutation only needs to end in an
+ * emit() call to be durable, nothing else to remember.
  */
 
 export type TripEventType =
@@ -71,6 +77,73 @@ export interface Trip {
   agentLog?: { tool: string; input: unknown }[];
 }
 
+/**
+ * One row per trip for list screens, so the app doesn't have to load every
+ * full trip just to draw a dashboard. Counts cover bookable items only
+ * (flights, lodging, activities), not spend estimates like food.
+ */
+export interface TripSummary {
+  id: string;
+  createdAt: string;
+  /** The planner's one-paragraph description of the current plan. */
+  summary: string;
+  version: number;
+  eventType?: EventType;
+  origin?: string;
+  destination: string;
+  destinationName?: string;
+  startDate: string;
+  endDate: string;
+  travelers: number;
+  /** The traveler's total budget (the overall cap). */
+  budgetCents: Cents;
+  /** What the current plan spends, including estimates. */
+  plannedCents: Cents;
+  /** What has actually been paid for booked items. */
+  paidCents: Cents;
+  bufferCents: Cents;
+  /** Bookable items by status. */
+  items: Record<PlanItemStatus, number>;
+  /** Total price of bookable items still waiting to be approved or booked. */
+  openBookingsCents: Cents;
+  /** Payments waiting for the traveler's signature. */
+  pendingSignatures: number;
+  lastEvent?: { type: TripEventType; message: string; at: string };
+}
+
+export function summarizeTrip(trip: Trip): TripSummary {
+  const { plan } = trip;
+  const bookable = plan.items.filter((i) => i.kind === "booking");
+  const items: Record<PlanItemStatus, number> = { proposed: 0, approved: 0, booking: 0, booked: 0, failed: 0, cancelled: 0 };
+  let openBookingsCents = 0;
+  for (const item of bookable) {
+    items[item.status] += 1;
+    if (item.status === "proposed" || item.status === "approved") openBookingsCents += item.priceCents;
+  }
+  const last = trip.events[trip.events.length - 1];
+  return {
+    id: trip.id,
+    createdAt: trip.createdAt,
+    summary: plan.summary,
+    version: plan.version,
+    eventType: plan.request.eventType,
+    origin: plan.request.origin,
+    destination: plan.request.destination,
+    destinationName: plan.request.destinationName,
+    startDate: plan.request.startDate,
+    endDate: plan.request.endDate,
+    travelers: plan.request.travelers,
+    budgetCents: plan.request.budgetCents,
+    plannedCents: plan.totalCents,
+    paidCents: plan.envelopes.reduce((total, e) => total + e.committedCents, 0),
+    bufferCents: plan.bufferCents,
+    items,
+    openBookingsCents,
+    pendingSignatures: Object.keys(trip.pendingSignatures).length,
+    lastEvent: last ? { type: last.type, message: last.message, at: last.at } : undefined,
+  };
+}
+
 /** Payments layer, plus the optional hooks the sandbox (and later Solana) layer exposes. */
 export type TripPayments = PaymentGateway & {
   setRules?(tripId: string, rules: SpendingRules): void;
@@ -84,7 +157,6 @@ export interface TripServiceOptions {
 }
 
 export class TripService {
-  private readonly trips = new Map<string, Trip>();
   readonly events = new EventEmitter();
 
   constructor(
@@ -92,14 +164,15 @@ export class TripService {
     private readonly executor: BookingExecutor,
     private readonly payments: TripPayments,
     private readonly opts: TripServiceOptions = {},
+    private readonly store: TripStore = new InMemoryTripStore(),
   ) {}
 
   list(): Trip[] {
-    return [...this.trips.values()];
+    return this.store.list();
   }
 
   get(tripId: string): Trip {
-    const trip = this.trips.get(tripId);
+    const trip = this.store.get(tripId);
     if (!trip) throw new NotFoundError(`Trip ${tripId} not found`);
     return trip;
   }
@@ -117,7 +190,7 @@ export class TripService {
       pendingSignatures: {},
       agentLog: outcome.agentLog,
     };
-    this.trips.set(id, trip);
+    this.store.save(trip);
     this.syncSpendingRules(trip);
     this.emit(trip, "plan_created", outcome.plan.summary);
     return trip;
@@ -304,6 +377,7 @@ export class TripService {
   private emit(trip: Trip, type: TripEventType, message: string, itemId?: string, changes?: PlanChange[]): void {
     const event: TripEvent = { id: newId("evt"), tripId: trip.id, at: new Date().toISOString(), type, message, itemId, changes };
     trip.events.push(event);
+    this.store.save(trip);
     this.events.emit("event", event);
   }
 }

@@ -9,7 +9,9 @@ packages/
   shared/    Domain types + the contracts between layers (TravelPlan, PaymentGateway, BookingOutcome), Duffel client
   planner/   Planning & optimization engine: budget allocator, optimizer, Claude planning agent, replanner, search providers
   booking/   Booking execution: supplier adapters (sandbox, Duffel), executor (re-quote → authorize → book → capture), sandbox payments
-  api/       Trip orchestration service + HTTP API (Hono), live event stream for the app
+  api/       Trip orchestration service + HTTP API (Hono), SQLite-backed persistence (store.ts), live event stream for the app
+apps/
+  web/       React + Vite product surface: create a trip, see the live itinerary, approve/sign/cancel, SSE updates
 scripts/
   demo.ts    End-to-end walkthrough: plan → approve → failures → replan → book
 ```
@@ -20,7 +22,8 @@ scripts/
 npm install
 npm test            # 43 tests: allocator, optimizer, replanner, agent tools, executor, API
 npm run demo        # full loop in the terminal with sandbox suppliers and payments
-npm run dev         # API on http://localhost:8787
+npm run dev         # API on http://localhost:8787 (trips persist to data/trips.db)
+npm run dev:web     # web app on http://localhost:5173
 ```
 
 Optional, in `.env` (see `.env.example`):
@@ -31,8 +34,26 @@ Optional, in `.env` (see `.env.example`):
 | `PLANNER_EFFORT` | `low` … `max`, default `high`. |
 | `DUFFEL_ACCESS_TOKEN` + `FLIGHT_PROVIDER=duffel` | Live flight search and real (test-mode) flight bookings through Duffel. Use a `duffel_test_…` token. |
 | `AUTO_APPROVE_UP_TO_CENTS` | Spends above this need the traveler's signature. Default 50000 ($500). |
+| `DATABASE_PATH` | Where trips are persisted (SQLite). Default `data/trips.db`; use `:memory:` for a throwaway run. |
 
 `npm run demo -- --agent` runs the demo with the Claude agent.
+
+In `apps/web/.env` (see `apps/web/.env.example`): `VITE_API_URL` if the API isn't on the default `http://localhost:8787`.
+
+## The web app (apps/web)
+
+Three columns, as in the Figma: event-type filters and page tools on the left, the working area in the middle, main actions on the right (folded into a top bar and bottom bar on phones).
+
+| Screen | Route | Data |
+| --- | --- | --- |
+| Events | `#/` and `#/?type=flight` | `GET /trips` (polled every 8 s) |
+| Event | `#/event/<id>` | `GET /trips/:id` plus the live SSE stream |
+| Plan New Event | `#/new` | `POST /trips` |
+| Fund Wallet | `#/wallet` | **Demo only**: a pretend balance in localStorage. Paid and waiting figures are real. |
+| History, Notifications | `#/history`, `#/notifications` | Built from each trip's event log and pending signatures |
+| Support | `#/support` | `GET /health` and a copy-diagnostics button |
+
+`eventType` (flight, vacation, shopping, international, local) is a label for filtering. The planner treats all types the same.
 
 ## How the planning engine works
 
@@ -60,6 +81,14 @@ Optional, in `.env` (see `.env.example`):
 4. **Capture** the payment. If capture fails, the supplier booking is cancelled. Any failure after step 2 voids the hold, so a failed booking never moves money.
 
 `TripService` (api) sends `price_changed`, `unavailable` and `failed` outcomes back into the replanner, and keeps the spending rules in sync with the current envelopes.
+
+## Persistence
+
+Trips are stored through the `TripStore` interface (`packages/api/src/store.ts`): `list`, `get`, `save`. `TripService` calls `save` once, inside its private `emit()` helper — every mutating method ends by emitting an event, so that's the single place a trip is written back, and adding a new mutation only needs to end in `emit()` to be durable.
+
+Two implementations:
+- `InMemoryTripStore` — the default when no store is passed to `TripService`, used by the existing tests. Same behavior as the old in-memory `Map`.
+- `SqliteTripStore` — what `createDeps()` (api) actually uses. Built on Node's built-in `node:sqlite`, so there's no native dependency to install. A trip (plan, envelopes, items, offers, history, events) is stored as one JSON row per trip rather than normalized into columns — nothing needs to query *inside* a trip from SQL yet. If that changes, that's the point to add real columns or a child table for the data that needs it, not before.
 
 ## Interfaces for the other layers
 
@@ -95,7 +124,9 @@ interface PaymentGateway {
 
 ## Roadmap status
 
-- **Phase 0:** done. Planning and optimization, budget envelopes, mock bookings and payments, replanning.
-- **Phase 1:** the payments interface is ready for the Solana layer. Sandbox suppliers are in place.
+- **Phase 0:** done. Planning and optimization, budget envelopes, mock bookings and payments, replanning, SQLite persistence, and a basic web UI (create a trip, see the live itinerary, approve/sign/cancel, live events).
+- **Phase 1:** the payments interface is ready for the Solana layer — `SandboxPaymentGateway` is a reference implementation to build the real one against. Sandbox suppliers are in place.
 - **Phase 2:** Duffel flight search and booking adapters are written but not yet run against a live token. Hotels and activities still need real suppliers. Candidates: Duffel Stays, Hotelbeds, Viator, GetYourGuide.
 - **Phase 3:** add more suppliers per category behind the same `SearchProvider` and `SupplierAdapter` interfaces. The optimizer already compares across suppliers.
+
+Not yet done: auth (any trip ID can be read/written by anyone who has it), and the web UI's manual `/replan` triggers (budget or preference changes) aren't wired up — only approve/sign/cancel/refresh-prices are.

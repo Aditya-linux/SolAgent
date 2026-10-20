@@ -3,10 +3,12 @@
   "private": true,
   "type": "module",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "apps/*"
   ],
   "scripts": {
     "dev": "tsx watch packages/api/src/server.ts",
+    "dev:web": "npm run dev -w apps/web",
     "start": "tsx packages/api/src/server.ts",
     "demo": "tsx scripts/demo.ts",
     "test": "vitest run",
@@ -19,6 +21,6 @@
     "vitest": "^4.1.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   }
 }
